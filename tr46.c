@@ -19,6 +19,7 @@
 // includes for libunistring
 #include <unicase.h>
 #include <unistr.h>
+#include <unictype.h>
 
 // includes for libidn2
 #include <idn2.h>
@@ -27,6 +28,190 @@
 #define countof(a) (sizeof(a)/sizeof(*(a)))
 
 static int ok, failed;
+
+#define IDNA_FLG_VALID                   1
+#define IDNA_FLG_MAPPED                  2
+#define IDNA_FLG_IGNORED                 4
+#define IDNA_FLG_DEVIATION               8
+#define IDNA_FLG_DISALLOWED             16
+#define IDNA_FLG_DISALLOWED_STD3_MAPPED 32
+#define IDNA_FLG_DISALLOWED_STD3_VALID  64
+
+typedef struct {
+	uint32_t
+		cp1, cp2;
+	uint32_t
+		mapping[19];
+	char
+		flag;
+} IDNAMap;
+
+static IDNAMap idna_map[10000];
+static size_t map_pos;
+
+static char *_nextField(char **line)
+{
+	char *s = *line, *e;
+
+	if (!*s)
+		return NULL;
+
+	if (!(e = strpbrk(s, ";#"))) {
+		e = *line += strlen(s);
+	} else {
+		*line = e + (*e == ';');
+		*e = 0;
+	}
+
+	// trim leading and trailing whitespace
+	while (isspace(*s)) s++;
+	while (e > s && isspace(e[-1])) *--e = 0;
+
+	return s;
+}
+
+static int _scan_file(const char *fname, int(*scan)(char *))
+{
+	FILE *fp = fopen(fname, "r");
+	char *buf = NULL, *linep;
+	size_t bufsize = 0;
+	ssize_t buflen;
+	int ret = 0;
+
+	if (!fp) {
+		failed++;
+		fprintf(stderr, "Failed to open IdnaTest.txt (%d)\n", errno);
+		return -1;
+	}
+
+	while ((buflen = getline(&buf, &bufsize, fp)) >= 0) {
+		linep = buf;
+
+		while (isspace(*linep)) linep++; // ignore leading whitespace
+
+		// strip off \r\n
+		while (buflen > 0 && (buf[buflen] == '\n' || buf[buflen] == '\r'))
+			buf[--buflen] = 0;
+
+		if (!*linep || *linep == '#') continue; // skip empty lines and comments
+
+		if ((ret = scan(linep))) {
+			failed++;
+			break;
+		}
+	}
+
+	free(buf);
+	fclose(fp);
+
+	return ret;
+}
+
+static int read_IdnaMappings(char *linep)
+{
+	IDNAMap *map = &idna_map[map_pos];
+	char *flag, *codepoint, *mapping;
+	int n;
+
+	codepoint = _nextField(&linep);
+	flag      = _nextField(&linep);
+	mapping   = _nextField(&linep);
+
+	if ((n = sscanf(codepoint, "%X..%X", &map->cp1, &map->cp2)) == 1) {
+		map->cp2 = map->cp1;
+	} else if (n != 2) {
+		printf("Failed to scan mapping codepoint '%s'\n", codepoint);
+		return -1;
+	}
+
+	if (map->cp1 > map->cp2) {
+		printf("Invalid codepoint range '%s'\n", codepoint);
+		return -1;
+	}
+
+	if (map_pos && map->cp1 <= idna_map[map_pos - 1].cp2) {
+		printf("Mapping codepoints out of order '%s'\n", codepoint);
+		return -1;
+	}
+
+	if (!strcmp(flag, "valid"))
+		map->flag = IDNA_FLG_VALID;
+	else if (!strcmp(flag, "mapped"))
+		map->flag = IDNA_FLG_MAPPED;
+	else if (!strcmp(flag, "disallowed"))
+		map->flag = IDNA_FLG_DISALLOWED;
+	else if (!strcmp(flag, "ignored"))
+		map->flag = IDNA_FLG_IGNORED;
+	else if (!strcmp(flag, "deviation"))
+		map->flag = IDNA_FLG_DEVIATION;
+	else if (!strcmp(flag, "disallowed_STD3_mapped"))
+		map->flag = IDNA_FLG_DISALLOWED_STD3_MAPPED;
+	else if (!strcmp(flag, "disallowed_STD3_valid"))
+		map->flag = IDNA_FLG_DISALLOWED_STD3_VALID;
+	else {
+		printf("Unknown flag '%s'\n", flag);
+		return -1;
+	}
+
+	if (mapping && *mapping) {
+		int n, pos;
+
+		for (unsigned it = 0; it < countof(map->mapping); it++) {
+			if ((n = sscanf(mapping, " %X%n", &map->mapping[it], &pos)) != 1)
+				break;
+
+			mapping += pos;
+		}
+		if (n == 1)
+			printf("%s: Too many mappings '%s'\n", codepoint, mapping);
+	} else if (map->flag == IDNA_FLG_MAPPED || map->flag == IDNA_FLG_DISALLOWED_STD3_MAPPED || map->flag == IDNA_FLG_DEVIATION) {
+		if (map->cp1 != 0x200C && map->cp1 != 0x200D) // ZWNJ and ZWJ
+			printf("Missing mapping for '%s'\n", codepoint);
+	}
+
+	if (++map_pos >= countof(idna_map)) {
+		printf("Internal map size too small\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+static int _compare_map(IDNAMap *m1, IDNAMap *m2)
+{
+	if (m1->cp1 < m2->cp1)
+		return -1;
+	if (m1->cp1 > m2->cp2)
+		return 1;
+	return 0;
+}
+
+static IDNAMap *_get_map(uint32_t c)
+{
+	IDNAMap key;
+
+	key.cp1 = c;
+	return bsearch(&key, idna_map, map_pos, sizeof(IDNAMap), (int(*)(const void *, const void *))_compare_map);
+}
+
+static int32_t _icu_decodeIdnaTest(UChar *src, int32_t len)
+{
+	int it2 = 0;
+
+	for (int it = 0; it < len;) {
+		if (src[it] == '\\' && src[it + 1] == 'u') {
+			src[it2++] =
+				((src[it + 2] >= 'A' ? src[it + 2] - 'A' + 10 : src[it + 2] - '0') << 12) +
+				((src[it + 3] >= 'A' ? src[it + 3] - 'A' + 10 : src[it + 3] - '0') << 8) +
+				((src[it + 4] >= 'A' ? src[it + 4] - 'A' + 10 : src[it + 4] - '0') << 4) +
+				(src[it + 5] >= 'A' ? src[it + 5] - 'A' + 10 : src[it + 5] - '0');
+			it += 6;
+		} else
+			src[it2++] = src[it++];
+	}
+
+	return it2;
+}
 
 static int _icu_toASCII(const char *utf8, char **ascii, int transitional)
 {
@@ -55,26 +240,7 @@ static int _icu_toASCII(const char *utf8, char **ascii, int transitional)
 		u_strFromUTF8(utf16_src, countof(utf16_src), &utf16_src_length, utf8, -1, &status);
 		if (U_SUCCESS(status)) {
 			// quick and dirty translation of '\uXXXX'
-			int it, it2;
-			for (it = 0, it2 = 0; it < utf16_src_length;) {
-//				printf("char %c (%d)\n", utf16_src[it], utf16_src[it]);
-				if (utf16_src[it] == '\\' && utf16_src[it + 1] == 'u') {
-//					printf(" %2X %c\n", (utf16_src[it + 2] >= 'A' ? utf16_src[it + 2] - 'A' + 10 : utf16_src[it + 2] -'0'), utf16_src[it + 2]);
-//					printf(" %2X %c\n", (utf16_src[it + 3] >= 'A' ? utf16_src[it + 3] - 'A' + 10 : utf16_src[it + 3] - '0'), utf16_src[it + 3]);
-//					printf(" %2X %c\n", (utf16_src[it + 4] >= 'A' ? utf16_src[it + 4] - 'A' + 10 : utf16_src[it + 4] - '0'), utf16_src[it + 4]);
-//					printf(" %2X %c\n", (utf16_src[it + 5] >= 'A' ? utf16_src[it + 5] - 'A' + 10 : utf16_src[it + 5] - '0'), utf16_src[it + 5]);
-					utf16_src[it2++] =
-						((utf16_src[it + 2] >= 'A' ? utf16_src[it + 2] - 'A' + 10 : utf16_src[it + 2] - '0') << 12) +
-						((utf16_src[it + 3] >= 'A' ? utf16_src[it + 3] - 'A' + 10 : utf16_src[it + 3] - '0') << 8) +
-						((utf16_src[it + 4] >= 'A' ? utf16_src[it + 4] - 'A' + 10 : utf16_src[it + 4] - '0') << 4) +
-						(utf16_src[it + 5] >= 'A' ? utf16_src[it + 5] - 'A' + 10 : utf16_src[it + 5] - '0');
-//					printf("new %04X\n", utf16_src[it2 - 1]);
-					it += 6;
-				} else
-					utf16_src[it2++] = utf16_src[it++];
-			}
-//			printf("utf16_len %d -> %d\n", utf16_src_length, it2);
-			utf16_src_length = it2;
+			utf16_src_length = _icu_decodeIdnaTest(utf16_src, utf16_src_length);
 
 			int32_t dst_length = uidna_nameToASCII((UIDNA *)idna, utf16_src, utf16_src_length, utf16_dst, countof(utf16_dst), &info, &status);
 			if (U_SUCCESS(status)) {
@@ -97,32 +263,144 @@ static int _icu_toASCII(const char *utf8, char **ascii, int transitional)
 	return ret;
 }
 
-static int _unistring_toASCII(const char *domain, char **ascii)
+static size_t _unistring_decodeIdnaTest(uint32_t *src, size_t len)
+{
+	size_t it2 = 0;
+
+	for (size_t it = 0; it < len;) {
+		if (src[it] == '\\' && src[it + 1] == 'u') {
+			src[it2++] =
+				((src[it + 2] >= 'A' ? src[it + 2] - 'A' + 10 : src[it + 2] - '0') << 12) +
+				((src[it + 3] >= 'A' ? src[it + 3] - 'A' + 10 : src[it + 3] - '0') << 8) +
+				((src[it + 4] >= 'A' ? src[it + 4] - 'A' + 10 : src[it + 4] - '0') << 4) +
+				(src[it + 5] >= 'A' ? src[it + 5] - 'A' + 10 : src[it + 5] - '0');
+			it += 6;
+		} else
+			src[it2++] = src[it++];
+	}
+
+	return it2;
+}
+
+static int _check_label(uint32_t *label, size_t len)
+{
+	// 1. check for NFC
+	// TODO
+
+	// 2. The label must not contain a U+002D HYPHEN-MINUS character in both the third and fourth positions
+	if (len >=4 && label[2] == '-' && label[3] == '-')
+		return -1;
+
+	// 3. The label must neither begin nor end with a U+002D HYPHEN-MINUS character
+	if (len && (label[0] == '-' || label[len - 1] == '-'))
+		return -1;
+
+	// 4. The label must not contain a U+002E ( . ) FULL STOP
+	for (size_t it = 0; it < len;)
+		if (label[it] == '.')
+			return -1;
+	// 5. The label must not begin with a combining mark, that is: General_Category=Mark
+	if (len && uc_combining_class(label[0]))
+		return -1;
+
+	// 6. Each code point in the label must only have certain status values according to Section 5, IDNA Mapping Table:
+	//    a. For Transitional Processing, each value must be valid.
+	//    b. For Nontransitional Processing, each value must be either valid or deviation.
+	// TODO
+
+	return 0;
+}
+
+/*
+ * Processing of domain_name string as descripbed in
+ *   http://www.unicode.org/reports/tr46/, 4 Processing
+ */
+static int _unistring_toASCII(const char *domain, char **ascii, int transitional)
 {
 	const uint8_t *domain_u8 = (uint8_t *) domain;
 	size_t len;
-	uint32_t *domain_u32, *lower_u32;
+	uint32_t *domain_u32;
+	int err = 0;
 
+	// convert UTF-8 to UCS-4 (Unicode))
 	if (!(domain_u32 = u8_to_u32(domain_u8, u8_strlen(domain_u8) + 1, NULL, &len))) {
 		printf("u8_to_u32(%s) failed (%d)\n", domain, errno);
 		return -1;
 	}
 	printf("len1=%zu\n", len);
 
-	lower_u32 = u32_tolower(domain_u32, len, 0, UNINORM_NFKC, NULL, &len);
+	// quick and dirty translation of '\uXXXX' found in IdnaTest.txt
+	len = _unistring_decodeIdnaTest(domain_u32, len);
+
+	size_t len2 = 0;
+	for (size_t it = 0; it < len; it++) {
+		IDNAMap *map = _get_map(domain_u32[it]);
+
+		if (!map || map->flag == IDNA_FLG_DISALLOWED) {
+			len2++;
+			err = 1;
+		} else if (map->flag == IDNA_FLG_MAPPED) {
+			for (int it2 = 0; map->mapping[it2];)
+				len2++;
+		} else if (map->flag == IDNA_FLG_VALID) {
+			len2++;
+		} else if (map->flag == IDNA_FLG_IGNORED) {
+			continue;
+		} else if (map->flag == IDNA_FLG_DEVIATION) {
+			if (transitional)
+				for (int it2 = 0; map->mapping[it2];)
+					len2++;
+		}
+	}
+
+	uint32_t *tmp = malloc(len2 * sizeof(uint32_t));
+
+	for (size_t it = 0; it < len; it++) {
+		uint32_t c = domain_u32[it];
+		IDNAMap *map = _get_map(c);
+
+		if (!map || map->flag == IDNA_FLG_DISALLOWED) {
+			tmp[len2++] = c;
+			err = 1;
+		} else if (map->flag == IDNA_FLG_MAPPED) {
+			for (int it2 = 0; map->mapping[it2];)
+				tmp[len2++] = map->mapping[it2];
+		} else if (map->flag == IDNA_FLG_VALID) {
+			tmp[len2++] = c;
+		} else if (map->flag == IDNA_FLG_IGNORED) {
+			continue;
+		} else if (map->flag == IDNA_FLG_DEVIATION) {
+			if (transitional)
+				for (int it2 = 0; map->mapping[it2];)
+					tmp[len2++] = map->mapping[it2];
+		}
+	}
 	free(domain_u32);
 
-	if (!lower_u32) {
-		printf("u32_tolower(%s) failed (%d)\n", domain, errno);
+	// Normalize to NFC
+	domain_u32 = u32_normalize(UNINORM_NFC, tmp, len2, NULL, &len);
+	free(tmp); tmp = NULL;
+
+	if (!domain_u32) {
+		printf("u32_normalize(%s) failed (%d)\n", domain, errno);
 		return -2;
 	}
-	printf("len2=%zu\n", len);
+	printf("len=%zu\n", len);
+
+	// split into labels and check
+	uint32_t *e, *s;
+	e = s = domain_u32;
+	for (e = s = domain_u32; *e; s = ++e) {
+		while (*e && *e != '.') e++;
+		if (_check_label(s, e - s))
+			err = 1;
+	}
 
 	if (ascii) {
 		int rc;
 
-		uint8_t *lower_u8 = u32_to_u8(lower_u32, len, NULL, &len);
-		free(lower_u32);
+		uint8_t *lower_u8 = u32_to_u8(domain_u32, len, NULL, &len);
+		free(domain_u32);
 
 		if (!lower_u8) {
 			printf("u32_to_u8(%s) failed (%d)\n", domain, errno);
@@ -134,11 +412,12 @@ static int _unistring_toASCII(const char *domain, char **ascii)
 		free(lower_u8);
 
 		if (rc != IDN2_OK) {
+			*ascii = NULL; /* libidn2 taints the variable on error */
 			printf("toASCII(%s) failed (%d): %s\n", domain, rc, idn2_strerror(rc));
 			return -4;
 		}
 	} else {
-		free(lower_u32);
+		free(domain_u32);
 	}
 
 	return 0;
@@ -174,7 +453,7 @@ static void test_selected(void)
 		}
 		free(ace); ace = NULL;
 
-		n = _unistring_toASCII(t->u8, &ace);
+		n = _unistring_toASCII(t->u8, &ace, 0);
 		if (n != t->result) {
 			failed++;
 			printf("Failed [%u]: _unistring_toASCII(%s) -> %d (expected %d)\n", it, t->u8, n, t->result);
@@ -188,101 +467,85 @@ static void test_selected(void)
 	}
 }
 
-static char *_nextField(char **line)
+static void _check_toASCII(char *source, char *expected, int transitional)
 {
-	char *s = *line, *e;
+	int n;
+	char *ace = NULL;
 
-	if (!*s)
-		return NULL;
+	n = _icu_toASCII(source, &ace, transitional);
 
-	if (!(e = strpbrk(s, ";#"))) {
-		e = *line += strlen(s);
+	if (n) {
+		failed++;
+		printf("Failed: _icu_toASCII(%s) -> %d (expected 0)\n", source, n);
+	} else if (strcmp(expected, ace)) {
+		failed++;
+		printf("Failed: _icu_toASCII(%s) -> %s (expected %s)\n", source, ace, expected);
 	} else {
-		*line = e + (*e == ';');
-		*e = 0;
+		printf("OK\n");
+		ok++;
 	}
 
-	// trim leading and trailing whitespace
-	while (isspace(*s)) s++;
-	while (e > s && isspace(e[-1])) *--e = 0;
+	free(ace); ace = NULL;
 
-	return s;
+	n = _unistring_toASCII(source, &ace, transitional);
+
+	if (n) {
+		failed++;
+		printf("Failed: _unistring_toASCII(%s) -> %d (expected 0) %p\n", source, n, ace);
+	} else if (strcmp(expected, ace)) {
+		failed++;
+		printf("Failed: _unistring_toASCII(%s) -> %s (expected %s) %p\n", source, ace, expected, ace);
+	} else {
+		printf("OK\n");
+		ok++;
+	}
+
+	free(ace); ace = NULL;
 }
 
-static void test_IdnaTest(void)
+static int test_IdnaTest(char *linep)
 {
-	FILE *fp = fopen("IdnaTest.txt", "r");
-	char *buf = NULL, *linep, *type, *source, *toUnicode, *toASCII, *NV8, *ace = NULL;
-	size_t bufsize = 0;
-	ssize_t buflen;
-	int n;
+	char *type, *source, *toUnicode, *toASCII, *NV8;
 
-	if (!fp) {
-		fprintf(stderr, "Failed to open IdnaTest.txt (%d)\n", errno);
-		return;
+	type = _nextField(&linep);
+	source  = _nextField(&linep);
+	toUnicode  = _nextField(&linep);
+	toASCII  = _nextField(&linep);
+	NV8  = _nextField(&linep); // if set, the input should be disallowed for IDNA2008
+
+	if (!*toUnicode)
+		toUnicode = source;
+	if (!*toASCII)
+		toASCII = toUnicode;
+
+	printf("##########%s#%s#%s#%s#%s#\n", type, source, toUnicode, toASCII, NV8);
+	if (*type == 'B') {
+		_check_toASCII(source, toASCII, 1);
+		_check_toASCII(source, toASCII, 0);
+	} else if (*type == 'T') {
+		_check_toASCII(source, toASCII, 1);
+	} else if (*type == 'N') {
+		_check_toASCII(source, toASCII, 0);
+	} else {
+		printf("Failed: Unknown type '%s'\n", type);
 	}
 
-	while ((buflen = getline(&buf, &bufsize, fp)) >= 0) {
-		linep = buf;
-
-		while (isspace(*linep)) linep++; // ignore leading whitespace
-		if (!*linep || *linep == '#') continue; // skip empty lines and comments
-
-		// strip off \r\n
-		while (buflen > 0 && (buf[buflen] == '\n' || buf[buflen] == '\r'))
-			buf[--buflen] = 0;
-
-		type = _nextField(&linep);
-		source  = _nextField(&linep);
-		toUnicode  = _nextField(&linep);
-		toASCII  = _nextField(&linep);
-		NV8  = _nextField(&linep); // if set, the input should be disallowed for IDNA2008
-
-		if (!*toUnicode)
-			toUnicode = source;
-		if (!*toASCII)
-			toASCII = toUnicode;
-
-		printf("##########%s#%s#%s#%s#%s#\n",type,source,toUnicode,toASCII,NV8);
-		if (*type == 'B' || *type == 'T') {
-			n = _icu_toASCII(source, &ace, 1);
-			if (n) {
-				failed++;
-				printf("Failed: _icu_toASCII(%s) -> %d (expected 0)\n", source, n);
-			} else if (strcmp(toASCII, ace)) {
-				failed++;
-				printf("Failed: _icu_toASCII(%s) -> %s (expected %s)\n", source, ace, toASCII);
-			} else {
-				printf("OK\n");
-				ok++;
-			}
-			free(ace); ace = NULL;
-		}
-		if (*type == 'B' || *type == 'N') {
-			n = _icu_toASCII(source, &ace, 0);
-			if (n) {
-				failed++;
-				printf("Failed: _icu_toASCII(%s) -> %d (expected 0)\n", source, n);
-			} else if (strcmp(toASCII, ace)) {
-				failed++;
-				printf("Failed: _icu_toASCII(%s) -> %s (expected %s)\n", source, ace, toASCII);
-			} else {
-				printf("OK\n");
-				ok++;
-			}
-			free(ace); ace = NULL;
-		}
-	}
-
-	free(buf);
-	fclose(fp);
+	return 0;
 }
 
 int main(int argc _U, const char **argv _U)
 {
-	test_IdnaTest(); // test all IDNA cases from Unicode 9.0.0
-	test_selected(); // some manual selectioons
+	// read IDNA mappings
+	if (_scan_file("IdnaMappingTable.txt", read_IdnaMappings))
+		goto out;
 
+	// test all IDNA cases from Unicode 9.0.0
+	if (_scan_file("IdnaTest.txt", test_IdnaTest))
+		goto out;
+
+	test_selected(); // some manual selections
+
+out:
 	if (failed) {
 		printf("Summary: %d out of %d tests failed\n", failed, ok + failed);
 		return 1;
