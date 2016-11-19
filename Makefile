@@ -4,7 +4,7 @@ ifndef VERBOSE
 	SILENT=@
 endif
 
-CC=$(SILENT)gcc -Wall -Wextra
+CC=$(SILENT)gcc -g -Wall -Wextra
 LN=$(SILENT)gcc 
 
 TARGETS=\
