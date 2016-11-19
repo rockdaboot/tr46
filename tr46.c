@@ -49,6 +49,16 @@ typedef struct {
 static IDNAMap idna_map[10000];
 static size_t map_pos;
 
+typedef struct {
+	uint32_t
+		cp1, cp2;
+	char
+		check; // 0=NO 2=MAYBE (YES if codepoint has no table entry)
+} NFCQCMap;
+
+static NFCQCMap nfcqc_map[140];
+static size_t nfcqc_pos;
+
 static char *_nextField(char **line)
 {
 	char *s = *line, *e;
@@ -194,6 +204,53 @@ static IDNAMap *_get_map(uint32_t c)
 	return bsearch(&key, idna_map, map_pos, sizeof(IDNAMap), (int(*)(const void *, const void *))_compare_map);
 }
 
+static NFCQCMap *_get_nfcqc_map(uint32_t c)
+{
+	NFCQCMap key;
+
+	key.cp1 = c;
+	return bsearch(&key, nfcqc_map, nfcqc_pos, sizeof(NFCQCMap), (int(*)(const void *, const void *))_compare_map);
+}
+
+static int read_NFCQC(char *linep)
+{
+	NFCQCMap *map = &nfcqc_map[nfcqc_pos];
+	char *codepoint, *check;
+	int n;
+
+	codepoint = _nextField(&linep);
+	            _nextField(&linep); // skip
+	check     = _nextField(&linep);
+
+	if ((n = sscanf(codepoint, "%X..%X", &map->cp1, &map->cp2)) == 1) {
+		map->cp2 = map->cp1;
+	} else if (n != 2) {
+		printf("Failed to scan mapping codepoint '%s'\n", codepoint);
+		return -1;
+	}
+
+	if (map->cp1 > map->cp2) {
+		printf("Invalid codepoint range '%s'\n", codepoint);
+		return -1;
+	}
+
+	if (*check == 'N')
+		map->check = 0;
+	else if (*check == 'M')
+		map->check = 1;
+	else {
+		printf("NFQQC: Unknown value '%s'\n", check);
+		return -1;
+	}
+
+	if (++nfcqc_pos >= countof(nfcqc_map)) {
+		printf("Internal NFCQC map size too small\n");
+		return -1;
+	}
+
+	return 0;
+}
+
 static int32_t _icu_decodeIdnaTest(UChar *src, int32_t len)
 {
 	int it2 = 0;
@@ -267,6 +324,7 @@ static size_t _unistring_decodeIdnaTest(uint32_t *src, size_t len)
 {
 	size_t it2 = 0;
 
+	// sigh, these Unicode people really mix UTF-8 and UCS-2/4
 	for (size_t it = 0; it < len;) {
 		if (src[it] == '\\' && src[it + 1] == 'u') {
 			src[it2++] =
@@ -282,32 +340,85 @@ static size_t _unistring_decodeIdnaTest(uint32_t *src, size_t len)
 	return it2;
 }
 
-static int _check_label(uint32_t *label, size_t len)
+static int _isNFC(uint32_t *label, size_t len)
 {
+	int lastCanonicalClass = 0;
+	int result = 1;
+
+	for (size_t it = 0; it < len; it++) {
+		uint32_t ch = label[it];
+
+		// supplementary code point
+		if (ch >= 0x10000)
+			it++;
+
+		int canonicalClass = uc_combining_class(ch);
+		if (lastCanonicalClass > canonicalClass && canonicalClass != 0)
+			return 0;
+
+		NFCQCMap *map = _get_nfcqc_map(ch);
+		if (map) {
+			if (map->check == 0)
+				return 0;
+			result = -1;
+		}
+
+		lastCanonicalClass = canonicalClass;
+	}
+
+	return result;
+}
+
+static int _check_label(uint32_t *label, size_t len, int transitional)
+{
+	int n;
+
 	// 1. check for NFC
-	// TODO
+	if ((n = _isNFC(label, len)) != 1) {
+		if (n == 0) {
+			printf("Not NFC\n");
+			return -1; // definitely not NFC
+		}
+		// TODO: 'Maybe NFC' requires conversion to NFC + comparison
+	}
 
 	// 2. The label must not contain a U+002D HYPHEN-MINUS character in both the third and fourth positions
-	if (len >= 4 && label[2] == '-' && label[3] == '-')
+	if (len >= 4 && label[2] == '-' && label[3] == '-') {
+		printf("Hyphen-Minus at pos 3+4\n");
 		return -1;
+	}
 
 	// 3. The label must neither begin nor end with a U+002D HYPHEN-MINUS character
-	if (len && (label[0] == '-' || label[len - 1] == '-'))
+	if (len && (label[0] == '-' || label[len - 1] == '-')) {
+		printf("Hyphen-Minus at begin or end\n");
 		return -1;
+	}
 
 	// 4. The label must not contain a U+002E ( . ) FULL STOP
 	for (size_t it = 0; it < len; it++)
-		if (label[it] == '.')
+		if (label[it] == '.') {
+			printf("Label containes FULL STOP\n");
 			return -1;
+		}
 
 	// 5. The label must not begin with a combining mark, that is: General_Category=Mark
-	if (len && uc_combining_class(label[0]))
+//	if (len && uc_combining_class(label[0])) {
+	if (len && uc_is_general_category(label[0], UC_CATEGORY_M)) {
+		printf("Label begins with combining mark\n");
 		return -1;
+	}
 
 	// 6. Each code point in the label must only have certain status values according to Section 5, IDNA Mapping Table:
 	//    a. For Transitional Processing, each value must be valid.
 	//    b. For Nontransitional Processing, each value must be either valid or deviation.
-	// TODO
+	for (size_t it = 0; it < len; it++) {
+		IDNAMap *map = _get_map(label[it]);
+
+		if (map->valid || (map->deviation && transitional))
+			continue;
+
+		return -1;
+	}
 
 	return 0;
 }
@@ -396,15 +507,49 @@ static int _unistring_toASCII(const char *domain, char **ascii, int transitional
 	e = s = domain_u32;
 	for (e = s = domain_u32; *e; s = e) {
 		while (*e && *e != '.') e++;
-		if (_check_label(s, e - s))
-			err = 1;
+
+		if (e - s >= 4 && e[0] == 'x' && e[1]=='n' && e[2] == '-' && e[3] == '-') {
+			// decode punycode and check result non-transitional
+			size_t ace_len;
+			uint8_t *ace = u32_to_u8(s, e - s + 1, NULL, &ace_len);
+			if (!ace) {
+				printf("u32_to_u8(%s) failed (%d)\n", domain, errno);
+				return -5;
+			}
+			ace[len - 1] = 0;
+
+			uint8_t *name;
+			int rc = idn2_register_u8(NULL, ace, &name, 0);
+			free(ace);
+
+			if (rc != IDN2_OK) {
+				printf("fromASCII(%s) failed (%d): %s\n", domain, rc, idn2_strerror(rc));
+				return -6;
+			}
+
+			size_t name_len;
+			uint32_t *name_u32 = u8_to_u32(name, strlen((char *) name), NULL, &name_len);
+			free(name);
+			
+			if (!name_u32) {
+				printf("u8_to_u32(%s) failed (%d)\n", domain, errno);
+				return -7;
+			}
+
+			if (_check_label(name_u32, name_len, 0))
+				err = 1;
+
+			free(name_u32);
+		} else {
+			if (_check_label(s, e - s, transitional))
+				err = 1;
+		}
+
 		if (*e)
 			e++;
 	}
 
 	if (ascii) {
-		int rc;
-
 		uint8_t *lower_u8 = u32_to_u8(domain_u32, len, NULL, &len);
 		free(domain_u32);
 
@@ -414,7 +559,7 @@ static int _unistring_toASCII(const char *domain, char **ascii, int transitional
 		}
 
 		// printf("lower_u8=%s\n", lower_u8);
-		rc = idn2_lookup_u8(lower_u8, (uint8_t **) ascii, 0);
+		int rc = idn2_lookup_u8(lower_u8, (uint8_t **) ascii, 0);
 		free(lower_u8);
 
 		if (rc != IDN2_OK) {
@@ -426,7 +571,7 @@ static int _unistring_toASCII(const char *domain, char **ascii, int transitional
 		free(domain_u32);
 	}
 
-	return 0;
+	return err;
 }
 
 static void test_selected(void)
@@ -544,6 +689,11 @@ int main(int argc _U, const char **argv _U)
 	// read IDNA mappings
 	if (_scan_file("IdnaMappingTable.txt", read_IdnaMappings))
 		goto out;
+
+	// read NFC QuickCheck table
+	if (_scan_file("DerivedNormalizationProps.txt", read_NFCQC))
+		goto out;
+	qsort(nfcqc_map, nfcqc_pos, sizeof(NFCQCMap), (int(*)(const void *, const void *))_compare_map);
 
 	// test all IDNA cases from Unicode 9.0.0
 	if (_scan_file(argc == 1 ? "IdnaTest.txt" : argv[1], test_IdnaTest))
