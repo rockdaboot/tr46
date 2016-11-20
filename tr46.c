@@ -379,7 +379,18 @@ static int _check_label(uint32_t *label, size_t len, int transitional)
 			printf("Not NFC\n");
 			return -1; // definitely not NFC
 		}
-		// TODO: 'Maybe NFC' requires conversion to NFC + comparison
+
+		// 'Maybe NFC' requires conversion to NFC + comparison
+      size_t tmplen;
+      uint32_t *tmp = u32_normalize (UNINORM_NFC, label, len, NULL, &tmplen);
+		int err = !tmp || u32_cmp(label, tmp, len);
+
+		free(tmp);
+
+		if (err) {
+			printf("Label is not NFC\n");
+			return -1;
+		}
 	}
 
 	// 2. The label must not contain a U+002D HYPHEN-MINUS character in both the third and fourth positions
@@ -424,7 +435,7 @@ static int _check_label(uint32_t *label, size_t len, int transitional)
 }
 
 /*
- * Processing of domain_name string as descripbed in
+ * Processing of domain_name string as described in
  *   http://www.unicode.org/reports/tr46/, 4 Processing
  */
 static int _unistring_toASCII(const char *domain, char **ascii, int transitional)
