@@ -59,6 +59,150 @@ typedef struct {
 static NFCQCMap nfcqc_map[140];
 static size_t nfcqc_pos;
 
+/*** Main punycode decode function ***/
+
+enum punycode_status {
+	punycode_success = 0,
+	punycode_bad_input = 1, /* Input is invalid.                       */
+	punycode_big_output = 2, /* Output would exceed the space provided. */
+	punycode_overflow = 3 /* Wider integers needed to process input. */
+};
+
+enum { base = 36, tmin = 1, tmax = 26, skew = 38, damp = 700,
+       initial_bias = 72, initial_n = 0x80, delimiter = 0x2D };
+
+static const uint32_t maxint = -1;
+
+/* flagged(bcp) tests whether a basic code point is flagged */
+/* (uppercase).  The behavior is undefined if bcp is not a  */
+/* basic code point.                                        */
+
+#define flagged(bcp) ((uint32_t)(bcp) - 65 < 26)
+
+/* basic(cp) tests whether cp is a basic code point: */
+#define basic(cp) ((uint32_t)(cp) < 0x80)
+
+/* delim(cp) tests whether cp is a delimiter: */
+#define delim(cp) ((cp) == delimiter)
+
+/* decode_digit(cp) returns the numeric value of a basic code */
+/* point (for use in representing integers) in the range 0 to */
+/* base-1, or base if cp does not represent a value.          */
+
+static uint32_t decode_digit(uint32_t cp)
+{
+	return cp - 48 < 10 ? cp - 22 : cp - 65 < 26 ? cp - 65 :
+		cp - 97 < 26 ? cp - 97 : base;
+}
+
+static uint32_t adapt(uint32_t delta, uint32_t numpoints, int firsttime)
+{
+	uint32_t k;
+
+	delta = firsttime ? delta / damp : delta / 2;
+	delta += delta / numpoints;
+
+	for (k = 0; delta > ((base - tmin) * tmax) / 2; k += base)
+		delta /= base - tmin;
+
+	return k + (base - tmin + 1) * delta / (delta + skew);
+}
+
+int punycode_decode(
+	const uint8_t *input,
+	size_t input_length,
+	uint32_t *output,
+	size_t *output_length,
+	unsigned char *case_flags)
+{
+	uint32_t n, out, i, max_out, bias, oldi, w, k, digit, t;
+	size_t b, j, in;
+
+	/* Initialize the state: */
+
+	n = initial_n;
+	out = i = 0;
+	max_out = *output_length > maxint ? maxint : (uint32_t) *output_length;
+	bias = initial_bias;
+
+	/* Handle the basic code points:  Let b be the number of input code */
+	/* points before the last delimiter, or 0 if there is none, then    */
+	/* copy the first b code points to the output.                      */
+
+	for (b = j = 0; j < input_length; ++j) if (delim(input[j])) b = j;
+	if (b > max_out) return punycode_big_output;
+
+	for (j = 0; j < b; ++j) {
+		if (case_flags) case_flags[out] = flagged(input[j]);
+		if (!basic(input[j])) return punycode_bad_input;
+		output[out++] = input[j];
+	}
+
+	/* Main decoding loop:  Start just after the last delimiter if any  */
+	/* basic code points were copied; start at the beginning otherwise. */
+
+	for (in = b > 0 ? b + 1 : 0; in < input_length; ++out) {
+
+		/* in is the index of the next ASCII code point to be consumed, */
+		/* and out is the number of code points in the output array.    */
+
+		/* Decode a generalized variable-length integer into delta,  */
+		/* which gets added to i.  The overflow checking is easier   */
+		/* if we increase i as we go, then subtract off its starting */
+		/* value at the end to obtain delta.                         */
+
+		for (oldi = i, w = 1, k = base;; k += base) {
+			if (in >= input_length)
+				return punycode_bad_input;
+
+			digit = decode_digit(input[in++]);
+			if (digit >= base)
+				return punycode_bad_input;
+
+			if (digit > (maxint - i) / w)
+				return punycode_overflow;
+
+			i += digit * w;
+			t = k <= bias /* + tmin */ ? tmin : /* +tmin not needed */
+				k >= bias + tmax ? tmax : k - bias;
+			if (digit < t) break;
+			if (w > maxint / (base - t))
+				return punycode_overflow;
+			w *= (base - t);
+		}
+
+		bias = adapt(i - oldi, out + 1, oldi == 0);
+
+		/* i was supposed to wrap around from out+1 to 0,   */
+		/* incrementing n each time, so we'll fix that now: */
+
+		if (i / (out + 1) > maxint - n)
+			return punycode_overflow;
+		n += i / (out + 1);
+		i %= (out + 1);
+
+		/* Insert n at position i of the output: */
+
+		/* not needed for Punycode: */
+		/* if (basic(n)) return punycode_bad_input; */
+		if (out >= max_out)
+			return punycode_big_output;
+
+		if (case_flags) {
+			memmove(case_flags + i + 1, case_flags + i, out - i);
+			/* Case of last ASCII code point determines case flag: */
+			case_flags[i] = flagged(input[in - 1]);
+		}
+
+		memmove(output + i + 1, output + i, (out - i) * sizeof *output);
+		output[i++] = n;
+	}
+
+	*output_length = (size_t) out;
+	/* cannot overflow because out <= old value of *output_length */
+	return punycode_success;
+}
+
 static char *_nextField(char **line)
 {
 	char *s = *line, *e;
@@ -369,6 +513,17 @@ static int _isNFC(uint32_t *label, size_t len)
 	return result;
 }
 
+static int _isBidi(uint32_t *label, size_t len)
+{
+	for (size_t it = 0; it < len; it++) {
+		int bc = uc_bidi_category(label[it]);
+		if (bc == UC_BIDI_R || bc == UC_BIDI_AL || bc == UC_BIDI_AN)
+			return 1;
+	}
+
+	return 0;
+}
+
 static int _check_label(uint32_t *label, size_t len, int transitional)
 {
 	int n;
@@ -425,11 +580,69 @@ static int _check_label(uint32_t *label, size_t len, int transitional)
 	for (size_t it = 0; it < len; it++) {
 		IDNAMap *map = _get_map(label[it]);
 
-		if (map->valid || (map->deviation && transitional))
+		if (map->valid || (map->deviation && !transitional))
 			continue;
 
+		printf("Label contains invalid %stransitional code point %04X\n", transitional ? "" : "non-", label[it]);
 		return -1;
 	}
+
+	return 0;
+
+	// IDNA2008 BIDI check (RFC 5893) - not wanted for TR46 tests
+	if (len && _isBidi(label, len)) {
+		int bc, endok = 1;
+
+		// 2.1
+		switch ((bc = uc_bidi_category(*label))) {
+		case UC_BIDI_L:
+			// check 2.5 & 2.6
+			for (size_t it = 1; it < len; it++) {
+				bc = uc_bidi_category(label[it]);
+				if (bc == UC_BIDI_L || bc == UC_BIDI_EN || bc == UC_BIDI_NSM) {
+					endok = 1;
+				} else {
+					if (bc != UC_BIDI_ES && bc != UC_BIDI_CS && bc != UC_BIDI_ET && bc != UC_BIDI_ON && bc != UC_BIDI_BN) {
+						printf("LTR label contains invalid code point\n");
+						return -1;
+					}
+					endok = 0;
+				}
+			}
+			if (!endok) {
+				printf("LTR label ends with invalid code point\n");
+				return -1;
+			}
+			break;
+		case UC_BIDI_R:
+		case UC_BIDI_AL:
+			// check 2.2, 2.3, 2.4
+			printf("Label[0]=%04X: %s\n", label[0], uc_bidi_category_name(bc));
+			for (size_t it = 1; it < len; it++) {
+				bc = uc_bidi_category(label[it]);
+				printf("Label[%zu]=%04X: %s\n", it, label[it], uc_bidi_category_name(bc));
+				if (bc == UC_BIDI_R || bc == UC_BIDI_AL || bc == UC_BIDI_EN  || bc == UC_BIDI_AN || bc == UC_BIDI_NSM) {
+					endok = 1;
+				} else {
+					if (bc != UC_BIDI_ES && bc != UC_BIDI_CS && bc != UC_BIDI_ET && bc != UC_BIDI_ON && bc != UC_BIDI_BN) {
+						printf("RTL label contains invalid code point\n");
+						return -1;
+					}
+					endok = 0;
+				}
+			}
+			if (!endok) {
+				printf("RTL label ends with invalid code point\n");
+				return -1;
+			}
+			break;
+		default:
+			printf("Label begins with invalid BIDI class %s\n", uc_bidi_category_name(bc));
+			return -1;
+		}
+	}
+
+	// IDNA2008 CONTEXTJ check
 
 	return 0;
 }
@@ -450,17 +663,24 @@ static int _unistring_toASCII(const char *domain, char **ascii, int transitional
 		printf("u8_to_u32(%s) failed (%d)\n", domain, errno);
 		return -1;
 	}
+	printf("len1=%zu\n", len);
 
 	// quick and dirty translation of '\uXXXX' found in IdnaTest.txt
 	len = _unistring_decodeIdnaTest(domain_u32, len);
+
+	printf("len2=%zu\n", len);
 
 	size_t len2 = 0;
 	for (size_t it = 0; it < len; it++) {
 		IDNAMap *map = _get_map(domain_u32[it]);
 
 		if (!map || map->disallowed) {
+			if (domain_u32[it]) {
+				printf("Disallowed character %04X\n", domain_u32[it]);
+//				err = 1;
+				return -1;
+			}
 			len2++;
-			err = 1;
 		} else if (map->mapped) {
 			for (int it2 = 0; map->mapping[it2]; it2++)
 				len2++;
@@ -477,6 +697,7 @@ static int _unistring_toASCII(const char *domain, char **ascii, int transitional
 		}
 	}
 
+	printf("len3=%zu\n", len2);
 	uint32_t *tmp = malloc(len2 * sizeof(uint32_t));
 
 	len2 = 0;
@@ -486,7 +707,6 @@ static int _unistring_toASCII(const char *domain, char **ascii, int transitional
 
 		if (!map || map->disallowed) {
 			tmp[len2++] = c;
-			err = 1;
 		} else if (map->mapped) {
 			for (int it2 = 0; map->mapping[it2];)
 				tmp[len2++] = map->mapping[it2++];
@@ -505,8 +725,10 @@ static int _unistring_toASCII(const char *domain, char **ascii, int transitional
 	free(domain_u32);
 
 	// Normalize to NFC
+	printf("len4=%zu\n", len2);
 	domain_u32 = u32_normalize(UNINORM_NFC, tmp, len2, NULL, &len);
 	free(tmp); tmp = NULL;
+	printf("len5=%zu\n", len);
 
 	if (!domain_u32) {
 		printf("u32_normalize(%s) failed (%d)\n", domain, errno);
@@ -519,38 +741,31 @@ static int _unistring_toASCII(const char *domain, char **ascii, int transitional
 	for (e = s = domain_u32; *e; s = e) {
 		while (*e && *e != '.') e++;
 
-		if (e - s >= 4 && e[0] == 'x' && e[1]=='n' && e[2] == '-' && e[3] == '-') {
+		printf("len6=%zu\n", e - s);
+		if (e - s >= 4 && s[0] == 'x' && s[1]=='n' && s[2] == '-' && s[3] == '-') {
 			// decode punycode and check result non-transitional
 			size_t ace_len;
-			uint8_t *ace = u32_to_u8(s, e - s + 1, NULL, &ace_len);
+			uint8_t *ace = u32_to_u8(s + 4, e - s - 4, NULL, &ace_len);
 			if (!ace) {
 				printf("u32_to_u8(%s) failed (%d)\n", domain, errno);
 				return -5;
 			}
-			ace[len - 1] = 0;
 
-			uint8_t *name;
-			int rc = idn2_register_u8(NULL, ace, &name, 0);
+			printf("1 %.*s\n", (int) ace_len, ace);
+			size_t name_len = 256;
+			uint32_t name_u32[256];
+			int rc = punycode_decode(ace, ace_len, name_u32, &name_len, NULL);
 			free(ace);
 
-			if (rc != IDN2_OK) {
+			if (rc) {
 				printf("fromASCII(%s) failed (%d): %s\n", domain, rc, idn2_strerror(rc));
 				return -6;
 			}
 
-			size_t name_len;
-			uint32_t *name_u32 = u8_to_u32(name, strlen((char *) name), NULL, &name_len);
-			free(name);
-			
-			if (!name_u32) {
-				printf("u8_to_u32(%s) failed (%d)\n", domain, errno);
-				return -7;
-			}
-
-			if (_check_label(name_u32, name_len, 0))
+			if (_check_label(name_u32, name_len, 0)) // non-transitional check
 				err = 1;
 
-			free(name_u32);
+//			free(name_u32);
 		} else {
 			if (_check_label(s, e - s, transitional))
 				err = 1;
@@ -634,7 +849,7 @@ static void _check_toASCII(char *source, char *expected, int transitional)
 	int n;
 	char *ace = NULL;
 
-	n = _icu_toASCII(source, &ace, transitional);
+/*	n = _icu_toASCII(source, &ace, transitional);
 
 	if (n && *expected != '[') {
 		failed++;
@@ -648,17 +863,18 @@ static void _check_toASCII(char *source, char *expected, int transitional)
 	}
 
 	free(ace); ace = NULL;
-
+*/
 	n = _unistring_toASCII(source, &ace, transitional);
 
-	if (n && *expected != '[') {
+	printf("n=%d expected=%s t=%d\n", n, expected, transitional);
+	if (n && !transitional && *expected != '[') {
 		failed++;
 		printf("Failed: _unistring_toASCII(%s) -> %d (expected 0) %p\n", source, n, ace);
-	} else if (*expected != '[' && strcmp(expected, ace)) {
+	} else if (n == 0 && !transitional &&  *expected != '[' && strcmp(expected, ace)) {
 		failed++;
 		printf("Failed: _unistring_toASCII(%s) -> %s (expected %s) %p\n", source, ace, expected, ace);
 	} else {
-		printf("OK\n");
+		printf("OK (%c)\n", transitional ? 'T' : 'N');
 		ok++;
 	}
 
@@ -679,6 +895,8 @@ static int test_IdnaTest(char *linep)
 		toUnicode = source;
 	if (!*toASCII)
 		toASCII = toUnicode;
+	if (NV8 && *NV8)
+		toASCII = "["; // indicates expected error
 
 	printf("##########%s#%s#%s#%s#%s#\n", type, source, toUnicode, toASCII, NV8);
 	if (*type == 'B') {
