@@ -419,7 +419,7 @@ static int _icu_toASCII(const char *utf8, char **ascii, int transitional)
 	UErrorCode status = 0;
 	/*
 	 * options
-	 * UIDNA_ALLOW_UNASSIGNED (uts#46 disallows unassigned code points
+	 * UIDNA_ALLOW_UNASSIGNED (uts#46 disallows unassigned code points)
 	 * UIDNA_USE_STD3_RULES (restrict labels to LDH chars = ASCII letters, digits, hyphen-minus)
 	 * UIDNA_CHECK_BIDI (error on BiDI code points)
 	 * UIDNA_CHECK_CONTEXTJ (only relevant for compatibility of newer IDNA implementations with IDNA2003)
@@ -799,7 +799,7 @@ static int _unistring_toASCII(const char *domain, char **ascii, int transitional
 
 	return err;
 }
-
+/*
 static void test_selected(void)
 {
 	static const struct test_data {
@@ -843,47 +843,45 @@ static void test_selected(void)
 		free(ace); ace = NULL;
 	}
 }
+*/
 
-static void _check_toASCII(char *source, char *expected, int transitional)
+static void _check_toASCII(char *source, char *expected, int transitional, int expected_toASCII_failure)
 {
 	int n;
 	char *ace = NULL;
 
-/*	n = _icu_toASCII(source, &ace, transitional);
+	for (int it = 0; it < 2; it++) {
+		if (it) {
+			printf("  * uni %c\n", transitional ? 'T' : 'N');
+			n = _unistring_toASCII(source, &ace, transitional);
+		} else {
+			printf("  * icu %c\n", transitional ? 'T' : 'N');
+			n = _icu_toASCII(source, &ace, transitional);
+		}
 
-	if (n && *expected != '[') {
-		failed++;
-		printf("Failed: _icu_toASCII(%s) -> %d (expected 0)\n", source, n);
-	} else if (*expected != '[' && strcmp(expected, ace)) {
-		failed++;
-		printf("Failed: _icu_toASCII(%s) -> %s (expected %s)\n", source, ace, expected);
-	} else {
-		printf("OK\n");
-		ok++;
+		printf("n=%d expected=%s t=%d, expected_failure=%d\n", n, expected, transitional, expected_toASCII_failure);
+		if (n && expected_toASCII_failure) {
+			printf("OK\n");
+			ok++;
+		} else if (n && !transitional && *expected != '[') {
+			failed++;
+			printf("Failed: _unistring_toASCII(%s) -> %d (expected 0) %p\n", source, n, ace);
+		} else if (n == 0 && !transitional &&  *expected != '[' && strcmp(expected, ace)) {
+			failed++;
+			printf("Failed: _unistring_toASCII(%s) -> %s (expected %s) %p\n", source, ace, expected, ace);
+		} else {
+			printf("OK\n");
+			ok++;
+		}
+
+		free(ace); ace = NULL;
 	}
-
-	free(ace); ace = NULL;
-*/
-	n = _unistring_toASCII(source, &ace, transitional);
-
-	printf("n=%d expected=%s t=%d\n", n, expected, transitional);
-	if (n && !transitional && *expected != '[') {
-		failed++;
-		printf("Failed: _unistring_toASCII(%s) -> %d (expected 0) %p\n", source, n, ace);
-	} else if (n == 0 && !transitional &&  *expected != '[' && strcmp(expected, ace)) {
-		failed++;
-		printf("Failed: _unistring_toASCII(%s) -> %s (expected %s) %p\n", source, ace, expected, ace);
-	} else {
-		printf("OK (%c)\n", transitional ? 'T' : 'N');
-		ok++;
-	}
-
-	free(ace); ace = NULL;
 }
 
 static int test_IdnaTest(char *linep)
 {
 	char *type, *source, *toUnicode, *toASCII, *NV8;
+	int expected_toASCII_failure;
 
 	type = _nextField(&linep);
 	source  = _nextField(&linep);
@@ -895,17 +893,16 @@ static int test_IdnaTest(char *linep)
 		toUnicode = source;
 	if (!*toASCII)
 		toASCII = toUnicode;
-	if (NV8 && *NV8)
-		toASCII = "["; // indicates expected error
+	expected_toASCII_failure = NV8 && *NV8;
 
 	printf("##########%s#%s#%s#%s#%s#\n", type, source, toUnicode, toASCII, NV8);
 	if (*type == 'B') {
-		_check_toASCII(source, toASCII, 1);
-		_check_toASCII(source, toASCII, 0);
+		_check_toASCII(source, toASCII, 1, expected_toASCII_failure);
+		_check_toASCII(source, toASCII, 0, expected_toASCII_failure);
 	} else if (*type == 'T') {
-		_check_toASCII(source, toASCII, 1);
+		_check_toASCII(source, toASCII, 1, expected_toASCII_failure);
 	} else if (*type == 'N') {
-		_check_toASCII(source, toASCII, 0);
+		_check_toASCII(source, toASCII, 0, expected_toASCII_failure);
 	} else {
 		printf("Failed: Unknown type '%s'\n", type);
 	}
