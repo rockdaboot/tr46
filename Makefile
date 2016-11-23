@@ -38,4 +38,5 @@ clean:
 # default rule to link executables
 %: %.o
 	@echo Linking $(@F) ...
-	$(LN) $^ -o $@ -licuuc -lunistring -lidn2
+#	$(LN) $^ -o $@ -licuuc -lunistring -lidn2
+	$(LN) $^ -o $@ -licuuc -lunistring ~/src/libidn2/.libs/libidn2.a
