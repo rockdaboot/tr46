@@ -61,15 +61,17 @@ static size_t nfcqc_pos;
 
 /*** Main punycode decode function ***/
 
-enum punycode_status {
+enum {
 	punycode_success = 0,
 	punycode_bad_input = 1, /* Input is invalid.                       */
 	punycode_big_output = 2, /* Output would exceed the space provided. */
 	punycode_overflow = 3 /* Wider integers needed to process input. */
 };
 
-enum { base = 36, tmin = 1, tmax = 26, skew = 38, damp = 700,
-       initial_bias = 72, initial_n = 0x80, delimiter = 0x2D };
+enum {
+	base = 36, tmin = 1, tmax = 26, skew = 38, damp = 700,
+	initial_bias = 72, initial_n = 0x80, delimiter = 0x2D
+};
 
 static const uint32_t maxint = -1;
 
@@ -112,8 +114,7 @@ int punycode_decode(
 	const uint8_t *input,
 	size_t input_length,
 	uint32_t *output,
-	size_t *output_length,
-	unsigned char *case_flags)
+	size_t *output_length)
 {
 	uint32_t n, out, i, max_out, bias, oldi, w, k, digit, t;
 	size_t b, j, in;
@@ -133,7 +134,6 @@ int punycode_decode(
 	if (b > max_out) return punycode_big_output;
 
 	for (j = 0; j < b; ++j) {
-		if (case_flags) case_flags[out] = flagged(input[j]);
 		if (!basic(input[j])) return punycode_bad_input;
 		output[out++] = input[j];
 	}
@@ -187,12 +187,6 @@ int punycode_decode(
 		/* if (basic(n)) return punycode_bad_input; */
 		if (out >= max_out)
 			return punycode_big_output;
-
-		if (case_flags) {
-			memmove(case_flags + i + 1, case_flags + i, out - i);
-			/* Case of last ASCII code point determines case flag: */
-			case_flags[i] = flagged(input[in - 1]);
-		}
 
 		memmove(output + i + 1, output + i, (out - i) * sizeof *output);
 		output[i++] = n;
@@ -766,7 +760,7 @@ static int _unistring_toASCII(const char *domain, char **ascii, int transitional
 
 			size_t name_len = 256;
 			uint32_t name_u32[256];
-			int rc = punycode_decode(ace, ace_len, name_u32, &name_len, NULL);
+			int rc = punycode_decode(ace, ace_len, name_u32, &name_len);
 			free(ace);
 
 			if (rc) {
