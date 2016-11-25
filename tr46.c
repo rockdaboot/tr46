@@ -509,7 +509,7 @@ static int _isNFC(uint32_t *label, size_t len)
 
 		// supplementary code point
 		if (ch >= 0x10000)
-			it++;
+			continue;
 
 		int canonicalClass = uc_combining_class(ch);
 		if (lastCanonicalClass > canonicalClass && canonicalClass != 0)
