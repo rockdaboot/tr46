@@ -551,8 +551,8 @@ static int _check_label(uint32_t *label, size_t len, int transitional)
 		}
 
 		// 'Maybe NFC' requires conversion to NFC + comparison
-      size_t tmplen;
-      uint32_t *tmp = u32_normalize (UNINORM_NFC, label, len, NULL, &tmplen);
+		size_t tmplen;
+		uint32_t *tmp = u32_normalize (UNINORM_NFC, label, len, NULL, &tmplen);
 		int err = !tmp || u32_cmp(label, tmp, len);
 
 		free(tmp);
