@@ -325,29 +325,23 @@ static int read_IdnaMappings(char *linep)
 	return 0;
 }
 
-static int _compare_map(IDNAMap *m1, IDNAMap *m2)
+static int _compare_map(uint32_t *c, IDNAMap *m2)
 {
-	if (m1->cp1 < m2->cp1)
+	if (*c < m2->cp1)
 		return -1;
-	if (m1->cp1 > m2->cp2)
+	if (*c > m2->cp2)
 		return 1;
 	return 0;
 }
 
 static IDNAMap *_get_map(uint32_t c)
 {
-	IDNAMap key;
-
-	key.cp1 = c;
-	return bsearch(&key, idna_map, map_pos, sizeof(IDNAMap), (int(*)(const void *, const void *))_compare_map);
+	return bsearch(&c, idna_map, map_pos, sizeof(IDNAMap), (int(*)(const void *, const void *))_compare_map);
 }
 
 static NFCQCMap *_get_nfcqc_map(uint32_t c)
 {
-	NFCQCMap key;
-
-	key.cp1 = c;
-	return bsearch(&key, nfcqc_map, nfcqc_pos, sizeof(NFCQCMap), (int(*)(const void *, const void *))_compare_map);
+	return bsearch(&c, nfcqc_map, nfcqc_pos, sizeof(NFCQCMap), (int(*)(const void *, const void *))_compare_map);
 }
 
 static int read_NFCQC(char *linep)
